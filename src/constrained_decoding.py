@@ -76,7 +76,6 @@ def generate_function_name(
         Generated function name.
     """
     generated = ""
-    found_valid = False
 
     for _ in range(max_tokens):
         logits = model.get_logits_from_input_ids(
@@ -95,13 +94,12 @@ def generate_function_name(
         best_id = _argmax(logits)
         best_str = vocab.get(best_id, "")
 
-        if best_str == '"' and found_valid:
+        if best_str == '"':
             break
 
         generated += best_str
 
         if generated in function_names:
-            found_valid = True
             break
 
     return generated
@@ -171,12 +169,6 @@ def generate_number_value(
         for token_id in range(len(logits)):
             token_str = vocab.get(token_id, "")
             if (
-                "," in token_str and token_str != ","
-            ) or (
-                "}" in token_str and token_str != "}"
-            ):
-                logits[token_id] = float("-inf")
-            elif (
                 token_str == "," or token_str == "}"
             ) and not _is_float(number):
                 logits[token_id] = float("-inf")
