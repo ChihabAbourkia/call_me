@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+data/output/
+*.egg-info/
+.venv/
