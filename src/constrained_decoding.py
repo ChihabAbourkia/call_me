@@ -1,7 +1,23 @@
-from typing import Any, List, Optional
+import json
+from typing import Any, Dict, List
 
 
-def system_prompt_builder(functions: list) -> str:
+def load_vocab(model: Any) -> Dict[int, str]:
+    """Load vocabulary mapping from token ID to string.
+
+    Args:
+        model: Small_LLM_Model instance.
+
+    Returns:
+        Dictionary mapping token_id -> token_string.
+    """
+    vocab_path = model.get_path_to_vocab_file()
+    with open(vocab_path, "r") as f:
+        vocab = json.load(f)
+    return {v: k for k, v in vocab.items()}
+
+
+def system_prompt_builder(functions: List[Any]) -> str:
     """Build a system prompt listing available functions.
 
     Args:
@@ -17,15 +33,25 @@ def system_prompt_builder(functions: list) -> str:
     for f in functions:
         param_parts = []
         for p, info in f.parameters.items():
-            param_parts.append(f'"{p}": {{"type": "{info.type}"}}')
+            param_parts.append(
+                f'"{p}": {{"type": "{info.type}"}}'
+            )
         params_str = ", ".join(param_parts)
         lines.append(
-            f'{{"name": "{f.name}", "description": "{f.description}", '
+            f'{{"name": "{f.name}", '
+            f'"description": "{f.description}", '
             f'"parameters": {{{params_str}}}}}'
         )
     lines.append(
         "Chose the appropriate function "
         "and its parameters based on the user input."
+    )
+    lines.append(
+        "Rules: generate only valid JSON. "
+        "Use exact types: numbers without quotes, "
+        "strings with quotes. "
+        "For regex use standard syntax without extra "
+        "parentheses."
     )
     return "\n".join(lines)
 
@@ -34,22 +60,20 @@ def generate_function_name(
     model: Any,
     context: str,
     function_names: List[str],
+    vocab: Dict[int, str],
     max_tokens: int = 30,
 ) -> str:
     """Generate a function name using constrained decoding.
 
-    At each step, every token is decoded to a string. If appending that
-    string to the current partial name would make it impossible for any
-    valid function name to still be a prefix, the token is masked with -inf.
-
     Args:
-        model: Object with encode(), decode(), get_logits_from_input_ids().
-        context: The full prompt context ending with '"name": "'.
-        function_names: List of valid function name strings.
-        max_tokens: Safety limit on number of tokens.
+        model: Small_LLM_Model instance.
+        context: Prompt context ending with '"name": "'.
+        function_names: Valid function name strings.
+        vocab: Pre-loaded token_id -> string mapping.
+        max_tokens: Safety limit.
 
     Returns:
-        The generated function name (without quotes).
+        Generated function name.
     """
     generated = ""
     found_valid = False
@@ -60,17 +84,16 @@ def generate_function_name(
         )
 
         for token_id in range(len(logits)):
-            token_str = model.decode([token_id])
-            if token_str is None:
-                token_str = ""
+            token_str = vocab.get(token_id, "")
             combined = generated + token_str
-            if not any(fn.startswith(combined) for fn in function_names):
+            if not any(
+                fn.startswith(combined)
+                for fn in function_names
+            ):
                 logits[token_id] = float("-inf")
 
         best_id = _argmax(logits)
-        best_str = model.decode([best_id])
-        if best_str is None:
-            best_str = ""
+        best_str = vocab.get(best_id, "")
 
         if best_str == '"' and found_valid:
             break
@@ -79,6 +102,7 @@ def generate_function_name(
 
         if generated in function_names:
             found_valid = True
+            break
 
     return generated
 
@@ -86,19 +110,19 @@ def generate_function_name(
 def generate_string_value(
     model: Any,
     context: str,
+    vocab: Dict[int, str],
     max_tokens: int = 100,
 ) -> str:
     """Generate a string parameter value token by token.
 
-    Generates until a closing double-quote is encountered.
-
     Args:
-        model: Object with encode(), decode(), get_logits_from_input_ids().
+        model: Small_LLM_Model instance.
         context: Prompt context ending with an opening '"'.
+        vocab: Pre-loaded token_id -> string mapping.
         max_tokens: Safety limit.
 
     Returns:
-        The generated string value (without quotes).
+        Generated string value.
     """
     value = ""
     for _ in range(max_tokens):
@@ -106,9 +130,7 @@ def generate_string_value(
             model.encode(context + value)[0].tolist()
         )
         best_id = _argmax(logits)
-        best_str = model.decode([best_id])
-        if best_str is None:
-            best_str = ""
+        best_str = vocab.get(best_id, "")
         if '"' in best_str:
             break
         value += best_str
@@ -127,20 +149,19 @@ def _is_float(s: str) -> bool:
 def generate_number_value(
     model: Any,
     context: str,
+    vocab: Dict[int, str],
     max_tokens: int = 30,
 ) -> str:
-    """Generate a numeric parameter value (float or int) with constrained decoding.
-
-    Only allows tokens that keep the accumulated value as a valid number.
-    Stops at ',' or '}' which are the JSON delimiters after a value.
+    """Generate a numeric value with constrained decoding.
 
     Args:
-        model: Object with encode(), decode(), get_logits_from_input_ids().
-        context: Prompt context ending just before the number.
+        model: Small_LLM_Model instance.
+        context: Prompt context ending before the number.
+        vocab: Pre-loaded token_id -> string mapping.
         max_tokens: Safety limit.
 
     Returns:
-        The generated number as a string (e.g. "2.0" or "42").
+        Generated number as string.
     """
     number = ""
     for _ in range(max_tokens):
@@ -148,20 +169,17 @@ def generate_number_value(
             model.encode(context + number)[0].tolist()
         )
         for token_id in range(len(logits)):
-            token_str = model.decode([token_id])
-            if token_str is None:
-                token_str = ""
-            # If token contains , or } but is not exactly , or }, mask it
-            if ("," in token_str and token_str != ",") or (
+            token_str = vocab.get(token_id, "")
+            if (
+                "," in token_str and token_str != ","
+            ) or (
                 "}" in token_str and token_str != "}"
             ):
                 logits[token_id] = float("-inf")
-            # If token is , or } but we don't have a valid number yet, mask it
-            elif (token_str == "," or token_str == "}") and not _is_float(
-                number
-            ):
+            elif (
+                token_str == "," or token_str == "}"
+            ) and not _is_float(number):
                 logits[token_id] = float("-inf")
-            # For any other token, check if number+token is still valid
             elif (
                 token_str != ","
                 and token_str != "}"
@@ -170,61 +188,15 @@ def generate_number_value(
                 logits[token_id] = float("-inf")
 
         best_id = _argmax(logits)
-        best_str = model.decode([best_id])
-        if best_str is None:
-            best_str = ""
+        best_str = vocab.get(best_id, "")
         if best_str == "," or best_str == "}":
             break
         number += best_str
     return number
 
 
-def generate_bool_value(
-    model: Any,
-    context: str,
-    max_tokens: int = 10,
-) -> bool:
-    """Generate a boolean parameter value with constrained decoding.
-
-    Only allows tokens that are prefixes of 'true' or 'false'.
-
-    Args:
-        model: Object with encode(), decode(), get_logits_from_input_ids().
-        context: Prompt context ending just before the boolean value.
-        max_tokens: Safety limit.
-
-    Returns:
-        Boolean value (True or False).
-    """
-    output = ""
-    for _ in range(max_tokens):
-        logits = model.get_logits_from_input_ids(
-            model.encode(context + output)[0].tolist()
-        )
-        for token_id in range(len(logits)):
-            token_str = model.decode([token_id])
-            if token_str is None:
-                token_str = ""
-            if not any(
-                s.startswith(output + token_str) for s in ("true", "false")
-            ):
-                logits[token_id] = float("-inf")
-
-        best_id = _argmax(logits)
-        best_str = model.decode([best_id])
-        if best_str is None:
-            best_str = ""
-        combined = output + best_str
-        if "true" in combined.lower():
-            return True
-        if "false" in combined.lower():
-            return False
-        output += best_str
-    return False
-
-
 def _argmax(logits: List[float]) -> int:
-    """Return the index of the maximum value in a list of floats."""
+    """Return the index of the maximum value."""
     best_idx = 0
     best_val = logits[0]
     for i in range(1, len(logits)):
@@ -232,28 +204,3 @@ def _argmax(logits: List[float]) -> int:
             best_val = logits[i]
             best_idx = i
     return best_idx
-
-
-def format_json(text: str) -> Optional[str]:
-    """Extract the first complete JSON object from text.
-
-    Finds the first '{' and matches braces to find the end.
-
-    Args:
-        text: Text that may contain a JSON object.
-
-    Returns:
-        The JSON substring, or None if no complete JSON found.
-    """
-    start = text.find("{")
-    if start == -1:
-        return None
-    brace_count = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            brace_count += 1
-        if text[i] == "}":
-            brace_count -= 1
-        if brace_count == 0:
-            return text[start : i + 1]
-    return None

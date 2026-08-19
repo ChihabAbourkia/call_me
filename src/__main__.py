@@ -1,19 +1,24 @@
 import json
 from pathlib import Path
+from typing import List
 
-from .parser import argparser
-from .loader import prompts_loader, function_loader
+from llm_sdk import Small_LLM_Model  # type: ignore[attr-defined]
+
 from .constrained_decoding import (
+    load_vocab,
     system_prompt_builder,
     generate_function_name,
     generate_string_value,
     generate_number_value,
-    generate_bool_value,
 )
-from llm_sdk import Small_LLM_Model
+from .json_validator import Functions
+from .loader import prompts_loader, function_loader
+from .parser import argparser
 
 
-def _get_function_by_name(functions: list, name: str) -> object:
+def _get_function_by_name(
+    functions: List[Functions], name: str
+) -> Functions:
     """Retrieve a function definition by name.
 
     Args:
@@ -29,17 +34,38 @@ def _get_function_by_name(functions: list, name: str) -> object:
     for f in functions:
         if f.name == name:
             return f
-    raise ValueError(f"Function '{name}' not found in definitions.")
+    raise ValueError(
+        f"Function '{name}' not found in definitions."
+    )
 
 
 def main() -> None:
-    """Main entry point: loads data, runs constrained decoding, writes output."""
+    """Load data, run constrained decoding, write output."""
     parser = argparser()
 
-    functions = function_loader(parser.functions_definition)
+    try:
+        functions = function_loader(
+            parser.functions_definition
+        )
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as e:
+        raise RuntimeError(
+            f"Failed to load function definitions: {e}"
+        )
     if not functions:
         raise RuntimeError("No function definitions found.")
-    prompts = prompts_loader(parser.input)
+
+    try:
+        prompts = prompts_loader(parser.input)
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as e:
+        raise RuntimeError(f"Failed to load prompts: {e}")
     if not prompts:
         raise RuntimeError("No input prompts found.")
 
@@ -49,7 +75,12 @@ def main() -> None:
     try:
         model = Small_LLM_Model(parser.model)
     except OSError:
-        raise RuntimeError(f"Model {parser.model} not found or failed to download.")
+        raise RuntimeError(
+            f"Model {parser.model} not found "
+            f"or failed to download."
+        )
+
+    vocab = load_vocab(model)
 
     results = []
     for p in prompts:
@@ -61,36 +92,46 @@ def main() -> None:
         )
         print(f"Processing: {prompt}")
 
-        func_name = generate_function_name(model, context, function_names)
-        func_def = _get_function_by_name(functions, func_name)
+        func_name = generate_function_name(
+            model, context, function_names, vocab
+        )
+        func_def = _get_function_by_name(
+            functions, func_name
+        )
 
         context += f'{func_name}", "parameters": {{'
 
-        parameters: dict = {}
+        parameters: dict[str, object] = {}
         param_items = list(func_def.parameters.items())
-        for i, (param_name, param_info) in enumerate(param_items):
+        for i, (param_name, param_info) in enumerate(
+            param_items
+        ):
             context += f'"{param_name}": '
             param_type = param_info.type
 
             if param_type == "string":
                 context += '"'
-                val = generate_string_value(model, context)
+                val = generate_string_value(
+                    model, context, vocab
+                )
                 context += val + '"'
                 parameters[param_name] = val
             elif param_type == "number":
-                val = generate_number_value(model, context)
+                val = generate_number_value(
+                    model, context, vocab
+                )
                 context += val
                 parameters[param_name] = float(val)
             elif param_type == "integer":
-                val = generate_number_value(model, context)
+                val = generate_number_value(
+                    model, context, vocab
+                )
                 context += val
                 parameters[param_name] = int(float(val))
-            elif param_type == "boolean":
-                val = generate_bool_value(model, context)
-                context += str(val).lower()
-                parameters[param_name] = val
             else:
-                val = generate_string_value(model, context)
+                val = generate_string_value(
+                    model, context, vocab
+                )
                 context += val + '"'
                 parameters[param_name] = val
 
